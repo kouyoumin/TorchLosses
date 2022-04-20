@@ -8,3 +8,4 @@
 ### Highlights
 - Cooperates with any loss (set reduction='none')
 - Sorts in any dimention
+- Dynamic hard example proportion (cosine annealing)
