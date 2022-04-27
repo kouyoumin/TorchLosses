@@ -27,9 +27,10 @@ class IoULoss(nn.Module):
         intersection_n = torch.sum((1-th_input) * (1-th_target), (2,3))
         union_n = torch.sum((1-th_input) + (1-th_target) - (1-th_input) * (1-th_target), (2,3)) + 1e-8
 
-        pos = (torch.sum(th_target, (2,3)) > 0).float()
+        pos = (torch.amax(th_target, (2,3)) > 0.5).float()
+        neg = (torch.amin(th_target, (2,3)) < 0.5).float()
         iou_loss = torch.zeros(pos.shape).cuda()
-        iou_loss = self.pos_weight.unsqueeze(0) * pos * ((1 - intersection_p / union_p).clamp_(0,1)) + self.neg_weight.unsqueeze(0) * (1 - pos) * ((1 - intersection_n / union_n).clamp_(0,1))
+        iou_loss = self.pos_weight.unsqueeze(0) * pos * ((1 - intersection_p / union_p).clamp_(0,1)) + self.neg_weight.unsqueeze(0) * neg * ((1 - intersection_n / union_n).clamp_(0,1))
 
         if self.reduction == 'none':
             final_loss = iou_loss
