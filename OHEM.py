@@ -21,6 +21,11 @@ class OHEMLoss():
 
     def __call__(self, input, target):
         loss = self.criterion(input, target)
+        
+        # Skip
+        if self.curr_prop == 1:
+            return loss.mean()
+        
         if self.reduction_dim is not None:
             loss = torch.mean(loss, self.reduction_dim)
         
@@ -31,7 +36,8 @@ class OHEMLoss():
 
     def step(self):
         self.curr_step += 1
-        self.curr_prop = self.final_prop + (self.init_prop - self.final_prop) * math.cos(min(self.curr_step / self.steps, 1)*(math.pi / 2))
+        if self.init_prop != self.final_prop:
+            self.curr_prop = self.final_prop + (self.init_prop - self.final_prop) * math.cos(min(self.curr_step / self.steps, 1)*(math.pi / 2))
         print('OHEM: curr_step = %d/%d' % (self.curr_step, self.steps))
         print('OHEM: curr_prop =', self.curr_prop)
 
