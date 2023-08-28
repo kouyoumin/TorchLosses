@@ -1,20 +1,20 @@
 import torch
 import torch.nn as nn
 
-class IoULoss(nn.Module):
+class DiceLoss(nn.Module):
     """
-    IoULoss
+    DiceLoss
     """
 
-    def __init__(self, dim=(2,3), pos_weight=1., neg_weight=0., class_weight=None, mode='pos_only', ignore_empty=True, ignore_full=True, eps=0., exp=1., reduction='none', verbose=False):
-        super(IoULoss, self).__init__()
+    def __init__(self, dim=(2,3), pos_weight=1., neg_weight=0., class_weight=None, mode='pos_only', ignore_empty=True, ignore_full=True, eps=1e-8, exp=1., reduction='none', verbose=False):
+        super(DiceLoss, self).__init__()
         if verbose:
-            print('IoULoss dim:', dim)
-            print('IoULoss pos_weight:', pos_weight)
-            print('IoULoss neg_weight:', neg_weight)
-            print('IoULoss class_weight:', class_weight)
-            print('IoULoss mode:', mode)
-            print('IoULoss reduction:', reduction)
+            print('DiceLoss dim:', dim)
+            print('DiceLoss pos_weight:', pos_weight)
+            print('DiceLoss neg_weight:', neg_weight)
+            print('DiceLoss class_weight:', class_weight)
+            print('DiceLoss mode:', mode)
+            print('DiceLoss reduction:', reduction)
         self.dim = dim
         self.pos_weight = pos_weight
         self.neg_weight = neg_weight
@@ -36,37 +36,36 @@ class IoULoss(nn.Module):
             class_weight = torch.ones(1, target.shape[1])
         
         intersection_p = torch.sum(th_input * th_target + self.eps, self.dim)
-        union_p = torch.sum(th_input + th_target - th_input * th_target + self.eps, self.dim)# + 1e-8
+        sum_p = torch.sum(th_input + th_target + self.eps, self.dim)# + 1e-8
 
         if self.mode != 'pos_only':
             intersection_n = torch.sum((1-th_input) * (1-th_target), self.dim)
-            union_n = torch.sum((1-th_input) + (1-th_target) - (1-th_input) * (1-th_target), self.dim)# + 1e-8
+            sum_n = torch.sum((1-th_input) + (1-th_target), self.dim)# + 1e-8
         
         if self.mode == 'pos_or_neg':
             pos = (torch.amax(th_target, self.dim) > 0.5).float()
-            iou_loss = self.pos_weight.unsqueeze(0) * class_weight * pos * ((1 - intersection_p / union_p).clamp_(0,1)) + self.neg_weight.unsqueeze(0) * class_weight * (1-pos) * ((1 - intersection_n / union_n).clamp_(0,1))
-            #iou_loss = class_weight * pos * ((1 - intersection_p / union_p).clamp_(0,1)) + class_weight * (1-pos) * ((1 - intersection_n / union_n).clamp_(0,1))
+            iou_loss = self.pos_weight.unsqueeze(0) * class_weight * pos * ((1 - 2 * intersection_p / sum_p).clamp_(0,1)) + self.neg_weight.unsqueeze(0) * class_weight * (1-pos) * ((1 - 2 * intersection_n / sum_n).clamp_(0,1))
         elif self.mode == 'both':
             class_weight = class_weight * (torch.amax(th_target, self.dim) > 0.5).float()
             class_weight[class_weight == 0] = 1
             pos = (torch.amax(th_target, self.dim) > 0.5).float() if self.ignore_empty else torch.ones_like(intersection_p)
             neg = (torch.amin(th_target, self.dim) < 0.5).float() if self.ignore_full else torch.ones_like(intersection_n)
             iou_loss = torch.zeros(pos.shape).cuda()
-            iou_loss = self.pos_weight.unsqueeze(0) * class_weight * pos * ((1 - intersection_p / union_p).clamp_(0,1)) + self.neg_weight.unsqueeze(0) * class_weight * neg * ((1 - intersection_n / union_n).clamp_(0,1))
+            iou_loss = self.pos_weight.unsqueeze(0) * class_weight * pos * ((1 - 2 * intersection_p / sum_p).clamp_(0,1)) + self.neg_weight.unsqueeze(0) * class_weight * neg * ((1 - 2 * intersection_n / sum_n).clamp_(0,1))
         elif self.mode == 'neg_only':
             class_weight = class_weight * (torch.amax(th_target, self.dim) > 0.5).float()
             class_weight[class_weight == 0] = 1
             #assert(class_weight.shape == th_target.shape[:2]) # apply only to positive samples
             neg = (torch.amin(th_target, self.dim) < 0.5).float() if self.ignore_full else torch.ones_like(intersection_n)
-            iou_loss = class_weight * neg * ((1 - intersection_n / union_n).clamp_(0,1))
-            #iou_loss = class_weight * ((1 - intersection_n / union_n).clamp_(0,1))
+            iou_loss = class_weight * neg * ((1 - 2 * intersection_n / sum_n).clamp_(0,1))
+            #iou_loss = class_weight * ((1 - intersection_n / sum_n).clamp_(0,1))
         else:
             # pos_only
             class_weight = class_weight * (torch.amax(th_target, self.dim) > 0.5).float()
             class_weight[class_weight == 0] = 1
             pos = (torch.amax(th_target, self.dim) > 0.5).float() if self.ignore_empty else torch.ones_like(intersection_p)
-            iou_loss = class_weight * pos * ((1 - intersection_p / union_p).clamp_(0,1))
-            #iou_loss = class_weight * ((1 - intersection_p / union_p).clamp_(0,1))
+            iou_loss = class_weight * pos * ((1 - 2 * intersection_p / sum_p).clamp_(0,1))
+            #iou_loss = class_weight * ((1 - intersection_p / sum_p).clamp_(0,1))
 
         iou_loss = iou_loss ** self.exp
         

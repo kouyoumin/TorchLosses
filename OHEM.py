@@ -28,9 +28,11 @@ class OHEM():
             if reduction_dim is not None:
                 loss = torch.mean(loss, reduction_dim)
             numel = loss.numel()
-            weight = torch.ones(numel).to(loss.get_device())
-            for i in range(numel):
-                weight[i] = ((numel - i)/numel) ** float(self.curr_exp)
+            weight = torch.Tensor(range(1, numel+1)).to(loss.get_device()).flip(0)
+            weight = (weight / numel) ** float(self.curr_exp)
+            #weight = torch.ones(numel).to(loss.get_device())
+            #for i in range(numel):
+            #    weight[i] = ((numel - i)/numel) ** float(self.curr_exp)
             sorted_loss, _ = torch.sort(loss.flatten(), descending=True, stable=False)
             return (sorted_loss * weight).mean() * (numel / weight.sum())
         elif self.groups > 1:
@@ -64,9 +66,10 @@ class OHEM():
         self.curr_step += 1
         if self.init_prop != self.final_prop:
             self.curr_prop = self.final_prop + (self.init_prop - self.final_prop) * math.cos(min(self.curr_step / self.steps, 1)*(math.pi / 2))
-        self.curr_exp = self.exp * min(self.curr_step / self.steps, 1)
+        
         print('OHEM: curr_step = %d/%d' % (self.curr_step, self.steps))
         if self.exp is not None:
+            self.curr_exp = self.exp * min(self.curr_step / self.steps, 1)
             print('OHEM: curr_exp =', self.curr_exp)
         elif self.groups > 1:
             print('OHEM: groups =', self.groups)
