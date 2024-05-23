@@ -6,7 +6,7 @@ class IntersectionLoss(nn.Module):
     IntersectionLoss
     """
 
-    def __init__(self, dim=(2,3), eps=0., exp=1., reduction='none', verbose=False):
+    def __init__(self, dim=(2,3), eps=0., exp=1., preprocess=nn.Identity(), reduction='none', verbose=False):
         super(IntersectionLoss, self).__init__()
         if verbose:
             print('IntersectionLoss dim:', dim)
@@ -14,12 +14,13 @@ class IntersectionLoss(nn.Module):
         self.dim = dim
         self.eps = eps
         self.exp = exp
+        self.preprocess = preprocess
         self.reduction = reduction
         
 
     def __call__(self, mask_obj, mask_base):
-        th_obj = mask_obj.sigmoid()
-        th_base = mask_base.sigmoid()
+        th_obj = self.preprocess(mask_obj)
+        th_base = self.preprocess(mask_base)
         
         intersection_p = torch.sum(th_obj * th_base + self.eps, self.dim)
         obj_p = torch.sum(th_obj + self.eps, self.dim)# + 1e-8

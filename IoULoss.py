@@ -5,8 +5,39 @@ class IoULoss(nn.Module):
     """
     IoULoss
     """
-
-    def __init__(self, dim=(2,3), pos_weight=1., neg_weight=0., class_weight=None, mode='pos_only', ignore_empty=True, ignore_full=True, eps=0., exp=1., reduction='none', verbose=False):
+    
+    def __init__(self, dim=(2,3), pos_weight=1., neg_weight=0., class_weight=None, mode='pos_only', preprocess=nn.Identity(), ignore_empty=True, ignore_full=True, eps=0., exp=1., reduction='none', verbose=False):
+        """
+        Constructor for IoULoss
+        
+        Parameters
+        ----------
+        dim : tuple, optional
+            Dimensions to reduce, by default (2,3)
+        pos_weight : float, optional
+            Positive weight, by default 1.
+        neg_weight : float, optional
+            Negative weight, by default 0.
+        class_weight : torch.Tensor, optional
+            Class weight, by default None
+        mode : str, optional
+            Mode of operation, by default 'pos_only'
+        preprocess : nn.Module, optional
+            Preprocessing layer, by default nn.Identity()
+            Set to nn.Sigmoid() if your model outputs logits
+        ignore_empty : bool, optional
+            Ignore empty masks, by default True
+        ignore_full : bool, optional
+            Ignore full masks, by default True
+        eps : float, optional
+            Epsilon, by default 0.
+        exp : float, optional
+            Exponent, by default 1.
+        reduction : str, optional
+            Reduction method, by default 'none'
+        verbose : bool, optional
+            Print debug information, by default False
+        """
         super(IoULoss, self).__init__()
         if verbose:
             print('IoULoss dim:', dim)
@@ -20,6 +51,7 @@ class IoULoss(nn.Module):
         self.neg_weight = neg_weight
         self.class_weight = class_weight
         self.mode = mode
+        self.preprocess = preprocess
         self.ignore_empty = ignore_empty
         self.ignore_full = ignore_full
         self.eps = eps
@@ -28,7 +60,7 @@ class IoULoss(nn.Module):
         
 
     def __call__(self, input, target):
-        th_input = input.sigmoid()
+        th_input = self.preprocess(input)
         th_target = target
         if isinstance(self.class_weight, torch.Tensor):
             class_weight = self.class_weight.reshape(1, target.shape[1])
