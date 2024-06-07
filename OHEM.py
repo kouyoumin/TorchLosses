@@ -30,6 +30,7 @@ class OHEM():
             numel = loss.numel()
             weight = torch.Tensor(range(1, numel+1)).to(loss.get_device()).flip(0)
             weight = (weight / numel) ** float(self.curr_exp)
+            weight *= weight.numel() / weight.sum() # Normalize
             #weight = torch.ones(numel).to(loss.get_device())
             #for i in range(numel):
             #    weight[i] = ((numel - i)/numel) ** float(self.curr_exp)
