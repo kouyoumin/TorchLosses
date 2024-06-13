@@ -40,7 +40,6 @@ class ContrastiveLoss(nn.Module):
 
         loss_a = F.cross_entropy(logits_ab, labels)
         loss_b = F.cross_entropy(logits_ba, labels)
-        print(loss_a, loss_b)
         loss = (loss_a + loss_b)/2
 
         return loss
