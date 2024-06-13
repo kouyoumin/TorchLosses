@@ -17,6 +17,7 @@ class ContrastiveLoss(nn.Module):
         Returns:
             A loss scalar.
         """
+        super(ContrastiveLoss, self).__init__()
         self.feature_norm = feature_norm
         self.temperature = temperature
 
