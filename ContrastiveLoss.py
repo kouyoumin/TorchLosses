@@ -34,7 +34,7 @@ class ContrastiveLoss(nn.Module):
         batch_size = f1.shape[0]
 
         # Create labels.
-        labels = torch.eye(batch_size)#F.one_hot(torch.arange(batch_size), batch_size)
+        labels = torch.eye(batch_size, device=f1.device)#F.one_hot(torch.arange(batch_size), batch_size)
 
         logits_ab = torch.matmul(f1, f2.T) / self.temperature
         logits_ba = torch.matmul(f2, f1.T) / self.temperature
