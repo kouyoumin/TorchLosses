@@ -4,17 +4,21 @@ import torch.nn.functional as F
 
 
 class MRL(nn.Module):
-    def __init__(self, criterion, groups=1, reduction='mean'):
+    def __init__(self, criterion, groups=1, linear=False, reduction='mean'):
         super(MRL, self).__init__()
         self.criterion = criterion
         self.groups = groups
+        self.linear = linear
         self.reduction = reduction
     
     
     def __call__(self, input, target):
         losses = []
-        for g in range(self.groups, 0, -1):
-            dimensions = input.shape[1] // g
+        for g in range(self.groups):
+            if self.linear:
+                dimensions = input.shape[1] * (g+1) // self.groups
+            else:
+                dimensions = input.shape[1] // 2**g
             partial_input = F.normalize(input[:, :dimensions], dim=1)
             partial_target = F.normalize(target[:, :dimensions], dim=1)
             loss = self.criterion(partial_input, partial_target)
