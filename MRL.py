@@ -5,17 +5,17 @@ import torch.nn.functional as F
 
 
 class MRL(nn.Module):
-    def __init__(self, criterion, groups:Union[Sequence[int], int]=1, linear=False, reduction='mean'):
+    def __init__(self, criterion, max_dimensions:int, groups:Union[Sequence[int], int]=1, linear=False, reduction='mean'):
         super(MRL, self).__init__()
         self.criterion = criterion
         self.linear = linear
         if not isinstance(groups, Sequence):
             self.groups = []
-            for g in range(self.groups):
+            for g in range(groups):
                 if self.linear:
-                    dimensions = input.shape[1] * (g+1) // self.groups
+                    dimensions = max_dimensions * (g+1) // groups
                 else:
-                    dimensions = input.shape[1] // 2**g
+                    dimensions = max_dimensions // 2**g
                 self.groups.append(dimensions)
         else:
             self.groups = groups
@@ -24,7 +24,7 @@ class MRL(nn.Module):
     
     def __call__(self, input, target):
         losses = []
-        for dimensions in range(self.groups):
+        for dimensions in self.groups:
             partial_input = F.normalize(input[:, :dimensions], dim=1)
             partial_target = F.normalize(target[:, :dimensions], dim=1)
             loss = self.criterion(partial_input, partial_target)
@@ -42,8 +42,8 @@ class MRL(nn.Module):
 
 def test_mrl():
     criterion = nn.MSELoss()
-    mrl1 = MRL(criterion, groups=1)
-    mrl2 = MRL(criterion, groups=2)
+    mrl1 = MRL(criterion, 8, groups=1)
+    mrl2 = MRL(criterion, 8, groups=2)
     
     input = torch.zeros(4,8)
     target = torch.zeros(4,8)
