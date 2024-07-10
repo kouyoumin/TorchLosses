@@ -6,7 +6,7 @@ import torch.nn.functional as F
 class ContrastiveLoss(nn.Module):
     
     def __init__(self,
-                feature_norm=True,
+                normalize=True,
                 temperature=1.0):
         """Compute loss for model.
 
@@ -18,13 +18,13 @@ class ContrastiveLoss(nn.Module):
             A loss scalar.
         """
         super(ContrastiveLoss, self).__init__()
-        self.feature_norm = feature_norm
+        self.normalize = normalize
         self.temperature = temperature
 
 
     def __call__(self, feature1, feature2):
         # Get (normalized) feature1 and feature2.
-        if self.feature_norm:
+        if self.normalize:
             f1 = F.normalize(feature1, dim=1)
             f2 = F.normalize(feature2, dim=1)
         else:
