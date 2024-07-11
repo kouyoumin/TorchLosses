@@ -20,10 +20,11 @@ class EuclideanLoss(nn.Module):
     
     
     def __call__(self, tensor1, tensor2):
+        dim = tuple(range(1,tensor1.ndim))
         if self.normalize:
-            tensor1 = F.normalize(tensor1, dim=1)
-            tensor2 = F.normalize(tensor2, dim=1)
-        dist = (tensor1 - tensor2).pow(2).sum(tuple(range(1,tensor1.ndim))).sqrt()
+            tensor1 = F.normalize(tensor1, dim=dim)
+            tensor2 = F.normalize(tensor2, dim=dim)
+        dist = (tensor1 - tensor2).pow(2).sum(dim).sqrt()
         if self.reduction == 'mean':
             return dist.mean()
         elif self.reduction == 'sum':
@@ -40,6 +41,13 @@ def test_euclidean_loss():
     tensor2 = torch.tensor([[3, 4]])
     loss = loss_fn(tensor1, tensor2)
     assert(loss.item() == 5.0)
+    
+    loss_fn = EuclideanLoss(normalize=True)
+    tensor3 = torch.randn((10, 1024))
+    tensor4 = F.normalize(tensor3, dim=1)
+    loss = loss_fn(tensor3, tensor4)
+    #print(loss)
+    assert(torch.isclose(loss, torch.tensor(0.0), atol=1e-7))
 
 
 if __name__ == '__main__':

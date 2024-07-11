@@ -4,7 +4,7 @@ import math
 
 
 class OHEM():
-    def __init__(self, exp=None, groups=1, init_prop=1.0, final_prop=0.15, steps=1e8, verbose=False):
+    def __init__(self, exp=None, groups=1, init_prop=1.0, final_prop=0.15, steps=1e8, auto_step=False, verbose=False):
         if verbose:
             #print('OHEMLoss reduction_dim:', reduction_dim)
             print('OHEMLoss exp:', exp)
@@ -12,6 +12,7 @@ class OHEM():
             print('OHEMLoss init_prop:', init_prop)
             print('OHEMLoss final_prop:', final_prop)
             print('OHEMLoss steps:', steps)
+            print('OHEMLoss auto_step:', auto_step)
         #self.reduction_dim = reduction_dim
         self.exp = exp
         self.curr_exp = 0.
@@ -19,8 +20,10 @@ class OHEM():
         self.init_prop = min(init_prop, 1)
         self.final_prop = max(final_prop, 0)
         self.steps = steps
+        self.auto_step = auto_step
         self.curr_prop = init_prop
         self.curr_step = 0
+        self.verbose = verbose
     
 
     def __call__(self, loss, reduction_dim=None):
@@ -35,6 +38,7 @@ class OHEM():
             #for i in range(numel):
             #    weight[i] = ((numel - i)/numel) ** float(self.curr_exp)
             sorted_loss, _ = torch.sort(loss.flatten(), descending=True, stable=False)
+            self.autostep()
             return (sorted_loss * weight).mean() * (numel / weight.sum())
         elif self.groups > 1:
             if reduction_dim is not None:
@@ -49,10 +53,12 @@ class OHEM():
             for prop in props:
                 topn = math.ceil(loss.numel() * prop)
                 total_loss += sorted_loss[:topn].mean()
+            self.autostep()
             return total_loss / self.groups
         else:
             # Skip
             if self.curr_prop == 1:
+                self.autostep()
                 return loss.mean()
             
             if reduction_dim is not None:
@@ -60,7 +66,13 @@ class OHEM():
             
             topn = math.ceil(loss.numel() * self.curr_prop)
             val, _ = torch.topk(loss.flatten(), topn)
+            self.autostep()
             return val.mean()
+        
+    
+    def autostep(self):
+        if self.auto_step:
+            self.step()
     
 
     def step(self):
@@ -68,23 +80,23 @@ class OHEM():
         if self.init_prop != self.final_prop:
             self.curr_prop = self.final_prop + (self.init_prop - self.final_prop) * math.cos(min(self.curr_step / self.steps, 1)*(math.pi / 2))
         
-        print('OHEM: curr_step = %d/%d' % (self.curr_step, self.steps))
-        if self.exp is not None:
-            self.curr_exp = self.exp * min(self.curr_step / self.steps, 1)
-            print('OHEM: curr_exp =', self.curr_exp)
-        elif self.groups > 1:
-            print('OHEM: groups =', self.groups)
-        else:
-            print('OHEM: curr_prop =', self.curr_prop)
-        
+        if self.verbose:
+            print('OHEM: curr_step = %d/%d' % (self.curr_step, self.steps))
+            if self.exp is not None:
+                self.curr_exp = self.exp * min(self.curr_step / self.steps, 1)
+                print('OHEM: curr_exp =', self.curr_exp)
+            elif self.groups > 1:
+                print('OHEM: groups =', self.groups)
+            else:
+                print('OHEM: curr_prop =', self.curr_prop)
 
 
 class OHEMLoss(OHEM):
-    def __init__(self, criterion, reduction_dim=None, exp=None, groups=1, init_prop=1.0, final_prop=0.15, steps=1e8, verbose=False):
+    def __init__(self, criterion, reduction_dim=None, exp=None, groups=1, init_prop=1.0, final_prop=0.15, steps=1e8, auto_step=False, verbose=False):
         
         self.criterion = criterion
         self.reduction_dim = reduction_dim
-        super(OHEMLoss, self).__init__(exp=exp, groups=groups, init_prop=init_prop, final_prop=final_prop, steps=steps, verbose=verbose)
+        super(OHEMLoss, self).__init__(exp=exp, groups=groups, init_prop=init_prop, final_prop=final_prop, steps=steps, auto_step=auto_step, verbose=verbose)
         if verbose:
             print('OHEMLoss criterion:', self.criterion)
     
