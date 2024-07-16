@@ -31,7 +31,7 @@ class OHEM():
             if reduction_dim is not None:
                 loss = torch.mean(loss, reduction_dim)
             numel = loss.numel()
-            weight = torch.Tensor(range(1, numel+1)).to(loss.get_device()).flip(0)
+            weight = torch.Tensor(range(1, numel+1)).to(torch.device(loss.device)).flip(0)
             weight = (weight / numel) ** float(self.curr_exp)
             weight *= weight.numel() / weight.sum() # Normalize
             #weight = torch.ones(numel).to(loss.get_device())
@@ -109,15 +109,23 @@ class OHEMLoss(OHEM):
 def test():
     from IoULoss import IoULoss
     steps = 50
-    dummy_input = torch.randn(2, 6, 256, 256)
-    dummy_target = torch.randn(2, 6, 256, 256)
+    dummy_input = torch.randn(2, 6, 256, 256).clamp(0, 1)
+    dummy_target = torch.randn(2, 6, 256, 256).clamp(0, 1)
     dummy_criterion = IoULoss(pos_weight=torch.ones(6), neg_weight=torch.ones(6), reduction='none')
     ohem = OHEMLoss(dummy_criterion, init_prop=1.0, final_prop=0.15, steps=steps, verbose=True)
     loss = ohem(dummy_input, dummy_target)
     print(loss)
     for i in range(steps+10):
         ohem.step()
-
+    
+    loss = torch.randn(10)
+    print(loss.get_device(), loss.device)
+    ohem = OHEM(exp=2., steps=10, auto_step=True, verbose=True)
+    assert(ohem.curr_exp == 0.)
+    for i in range(10):
+        ohem(loss)
+    assert(ohem.curr_exp == 2.)
+    
 
 if __name__ == '__main__':
     test()
