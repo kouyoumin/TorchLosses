@@ -31,7 +31,7 @@ class OHEM():
             if reduction_dim is not None:
                 loss = torch.mean(loss, reduction_dim)
             numel = loss.numel()
-            weight = torch.Tensor(range(1, numel+1)).to(torch.device(loss.device)).flip(0)
+            weight = torch.Tensor(range(numel, 0, -1)).to(torch.device(loss.device))
             weight = (weight / numel) ** float(self.curr_exp)
             weight *= weight.numel() / weight.sum() # Normalize
             #weight = torch.ones(numel).to(loss.get_device())
