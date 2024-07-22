@@ -80,15 +80,27 @@ class OHEM():
         if self.init_prop != self.final_prop:
             self.curr_prop = self.final_prop + (self.init_prop - self.final_prop) * math.cos(min(self.curr_step / self.steps, 1)*(math.pi / 2))
         
+        if self.exp is not None:
+            self.curr_exp = self.exp * min(self.curr_step / self.steps, 1)
+        
         if self.verbose:
             print('OHEM: curr_step = %d/%d' % (self.curr_step, self.steps))
             if self.exp is not None:
-                self.curr_exp = self.exp * min(self.curr_step / self.steps, 1)
                 print('OHEM: curr_exp =', self.curr_exp)
             elif self.groups > 1:
                 print('OHEM: groups =', self.groups)
             else:
                 print('OHEM: curr_prop =', self.curr_prop)
+    
+    
+    def print_status(self):
+        print('OHEM: curr_step = %d/%d' % (self.curr_step, self.steps))
+        if self.exp is not None:
+            print('OHEM: curr_exp =', self.curr_exp)
+        elif self.groups > 1:
+            print('OHEM: groups =', self.groups)
+        else:
+            print('OHEM: curr_prop =', self.curr_prop)
 
 
 class OHEMLoss(OHEM):
