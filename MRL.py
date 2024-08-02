@@ -32,6 +32,8 @@ class MRL(nn.Module):
                 partial_input = F.normalize(partial_input, dim=1)
                 partial_target = F.normalize(partial_target, dim=1)
             loss = self.criterion(partial_input, partial_target)
+            if loss.ndim > 1:
+                loss = loss.mean(tuple(range(1, loss.ndim)))
             losses += [loss]
         
         if self.reduction == 'none':
