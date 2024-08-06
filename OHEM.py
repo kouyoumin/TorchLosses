@@ -113,8 +113,8 @@ class OHEMLoss(OHEM):
             print('OHEMLoss criterion:', self.criterion)
     
 
-    def __call__(self, input, target):
-        loss = self.criterion(input, target)
+    def __call__(self, *args):
+        loss = self.criterion(*args)
         return super(OHEMLoss, self).__call__(loss, reduction_dim=self.reduction_dim)
     
 
