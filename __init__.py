@@ -1,6 +1,7 @@
 from .ContrastiveLoss import *
 from .DiceLoss import *
 from .EuclideanLoss import *
+from .ExpLoss import *
 from .F1Loss import *
 from .IntersectionLoss import *
 from .IoULoss import *
