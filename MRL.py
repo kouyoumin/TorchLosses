@@ -23,15 +23,20 @@ class MRL(nn.Module):
         self.reduction = reduction
     
     
-    def __call__(self, input, target):
+    def __call__(self, *args):
         losses = []
         for dimensions in self.groups:
-            partial_input = input[:, :dimensions]
-            partial_target = target[:, :dimensions]
+            partial_input = args[0][:, :dimensions]
+            partial_target = args[1][:, :dimensions]
             if self.normalize:
                 partial_input = F.normalize(partial_input, dim=1)
                 partial_target = F.normalize(partial_target, dim=1)
-            loss = self.criterion(partial_input, partial_target)
+            #print('MRL num args:', len(args))
+            if len(args) > 2:
+                loss = self.criterion(partial_input, partial_target, *args[2:])
+            else:
+                loss = self.criterion(partial_input, partial_target)
+            #loss = self.criterion(partial_input, partial_target)
             if loss.ndim > 1:
                 loss = loss.mean(tuple(range(1, loss.ndim)))
             losses += [loss]
