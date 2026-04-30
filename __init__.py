@@ -3,8 +3,10 @@ from .DiceLoss import *
 from .EuclideanLoss import *
 from .ExpLoss import *
 from .F1Loss import *
+from .GloriaLoss import *
 from .IntersectionLoss import *
 from .IoULoss import *
 from .MRL import *
 from .OHEM import *
+from .SIGRegLoss import *
 from .WeightedMultiLoss import *

@@ -13,6 +13,7 @@ class WeightedMultiLoss(torch.nn.Module):
     
     def __call__(self, *args):
         loss = 0
+        #print('WML num args:', len(args))
         for criterion, weight in zip(self.criterions, self.weights):
             if isinstance(criterion, torch.nn.CosineEmbeddingLoss):
                 loss += criterion(*args[:3]) * weight
