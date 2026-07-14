@@ -47,7 +47,7 @@ def attention_fn(query, context, temp1):
 
 
 def local_loss(
-    img_features, sentence_embs, sentence_cnt, temp1=4.0, temp2=5.0, temp3=5.0, reduction="mean"
+    img_features, sentence_embs, sentence_cnt, temp1=4.0, temp2=5.0, temp3=10.0, reduction="mean"
 ):
 
     batch_size = img_features.shape[0]
@@ -104,11 +104,17 @@ def local_loss(
 
 
 class GloriaLocalLoss(nn.Module):
-    def __init__(self, temp1=4.0, temp2=5.0, temp3=10.0, reduction="mean"):
+    def __init__(self, temp1=4.0, temp2=5.0, temp3=10.0, reduction="mean", train_temp=False):
         super(GloriaLocalLoss, self).__init__()
-        self.temp1 = temp1
-        self.temp2 = temp2
-        self.temp3 = temp3
+        self.train_temp = train_temp
+        if train_temp:
+            self.temp1 = nn.Parameter(torch.tensor(float(temp1)))
+            self.temp2 = nn.Parameter(torch.tensor(float(temp2)))
+            self.temp3 = nn.Parameter(torch.tensor(float(temp3)))
+        else:
+            self.temp1 = temp1
+            self.temp2 = temp2
+            self.temp3 = temp3
         self.reduction = reduction
 
     def __call__(self, img_features, sentence_embs, sentence_cnt):

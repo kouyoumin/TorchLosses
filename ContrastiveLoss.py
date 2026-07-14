@@ -7,7 +7,8 @@ class ContrastiveLoss(nn.Module):
 
     def __init__(self,
                 normalize=True,
-                temperature=0.2,
+                temperature=0.07,
+                train_temp=False,
                 false_negative_threshold=0.98,
                 queue_size=4096,
                 reduction='mean'):
@@ -15,6 +16,8 @@ class ContrastiveLoss(nn.Module):
         Args:
             normalize: L2-normalize features before computing similarity.
             temperature: Temperature for logit scaling (CLIP uses 0.07).
+            train_temp: If True, temperature is a learnable parameter (CLIP-style),
+                updated via backprop instead of staying fixed.
             false_negative_threshold: Cosine similarity above this is masked as
                 a potential false negative. Set to 1.0 to disable.
             queue_size: Number of past text embeddings kept as extra negatives
@@ -25,12 +28,18 @@ class ContrastiveLoss(nn.Module):
         super().__init__()
         self.normalize = normalize
         self.false_negative_threshold = false_negative_threshold
-        self.log_temperature = torch.tensor(temperature).log()
+        self.train_temp = train_temp
+        log_temperature = torch.tensor(temperature).log()
+        self.log_temperature = nn.Parameter(log_temperature) if train_temp else log_temperature
         self.queue_size = queue_size
         self.reduction = reduction
         self._queue: torch.Tensor | None = None
         self._queue_ptr = 0
         self._queue_filled = 0
+
+    @property
+    def temperature(self):
+        return self.log_temperature.exp().clamp(0.01, 0.5)
 
     def _enqueue(self, embeddings: torch.Tensor):
         B, D = embeddings.shape
