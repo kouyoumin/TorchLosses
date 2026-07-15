@@ -3,6 +3,7 @@ from .DiceLoss import *
 from .EuclideanLoss import *
 from .ExpLoss import *
 from .F1Loss import *
+from .FFFLoss import *
 from .GloriaLoss import *
 from .IntersectionLoss import *
 from .IoULoss import *
