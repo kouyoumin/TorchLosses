@@ -16,17 +16,25 @@ class FFFLoss(nn.Module):
 
     def __init__(self,
                 normalize=True,
-                # Defaults below were calibrated on the M2R_FRONTAL training
-                # set (frozen 202606221403/epoch25, full-set similarity stats
-                # + initial-loss minimization). Paper (arXiv:2405.10286) /
+                # logit scale/bias were calibrated on the M2R_FRONTAL training
+                # set (frozen 202606221403/epoch25, duplicate-only M,
+                # initial-loss minimization). Paper (arXiv:2405.10286) /
                 # SigLIP values are noted per argument.
-                logit_scale=4.19,   # paper/SigLIP init: 10
-                logit_bias=-4.18,   # paper/SigLIP init: -10
-                p1=0.768,           # paper: 0.27
-                p1_prime=0.712,     # paper: 0.24
-                p2=0.848,           # paper: 0.92
-                p3=0.9,             # paper: 0.99
-                p_dup=0.995,        # not in paper (exact-duplicate extension)
+                logit_scale=4.35,   # paper/SigLIP init: 10
+                logit_bias=-4.24,   # paper/SigLIP init: -10
+                # Similarity-threshold re-assignment is DISABLED by default
+                # (1.0). The paper computes these matrices with a FROZEN
+                # pretrained model; computing them online from the model
+                # being trained creates a positive feedback loop (drift ->
+                # more re-assignments -> collapse). Only enable them if the
+                # embeddings passed in come from a frozen reference model.
+                # Paper values: p1=0.27, p1'=0.24, p2=0.92, p3=0.99;
+                # M2R_FRONTAL/epoch25 calibration: 0.768/0.712/0.848/0.9.
+                p1=1.0,
+                p1_prime=1.0,
+                p2=1.0,
+                p3=1.0,
+                p_dup=1.0,          # embedding-based duplicates (superseded by dup_mask)
                 reduction='mean'):
         """
         Args:
@@ -42,11 +50,10 @@ class FFFLoss(nn.Module):
                 re-assignment (p1_prime < p1). Set to 1.0 to disable.
             p2: Image-image similarity threshold. Set to 1.0 to disable.
             p3: Text-text similarity threshold. Set to 1.0 to disable.
-            p_dup: Caption-level exact-duplicate threshold. Any caption pair
-                with cosine similarity above this is marked positive without
-                the p1_prime image-text gate (identical captions, e.g.
-                'No abnormal findings', are trustworthy matches even before
-                the image tower has converged). Set to 1.0 to disable.
+            p_dup: Caption-level exact-duplicate threshold on embedding
+                similarity. Ignored when a `dup_mask` is passed to forward()
+                (the preferred, collapse-proof way: string equality computed
+                by the caller). Set to 1.0 to disable.
             reduction: 'mean' | 'sum' | 'none'. 'mean' follows the paper
                 (sum over all pairs divided by N_txt); 'none' returns
                 per-image losses of shape (B,) whose mean equals 'mean'.
@@ -70,13 +77,25 @@ class FFFLoss(nn.Module):
     def temperature(self):
         return 1. / self.logit_scale
 
-    def forward(self, image_features, text_features):
+    def forward(self, image_features, text_features, dup_mask=None,
+                ref_image_features=None, ref_text_features=None):
         """
         Args:
             image_features: (B, D) image embeddings.
             text_features: (B, k, D) text embeddings, k captions per image
                 (all treated as positives of their image). (B, D) is accepted
                 and treated as k=1.
+            dup_mask: optional (B, B*k) bool tensor; True where caption j is
+                an exact duplicate (string equality) of any caption of image
+                i. Marked positive unconditionally. Preferred over p_dup
+                because it does not depend on the embeddings being trained.
+            ref_image_features, ref_text_features: optional embeddings from a
+                FROZEN reference model (same shapes as image_features/
+                text_features), used instead of the trainable embeddings to
+                compute the p1/p1_prime/p2/p3 similarity-threshold masks.
+                Required to safely enable those thresholds (see class
+                docstring) — pass both or neither. The sigmoid loss itself
+                still uses the trainable image_features/text_features.
         """
         if text_features.ndim == 2:
             text_features = text_features.unsqueeze(1)
@@ -94,6 +113,18 @@ class FFFLoss(nn.Module):
         s_it = torch.matmul(img, txt_flat.T)  # (B, B*k)
         logits = s_it * self.log_logit_scale.exp() + self.logit_bias
 
+        use_ref = ref_image_features is not None and ref_text_features is not None
+        if use_ref:
+            with torch.no_grad():
+                ref_img = F.normalize(ref_image_features, dim=-1) if self.normalize else ref_image_features
+                ref_txt = ref_text_features
+                if ref_txt.ndim == 2:
+                    ref_txt = ref_txt.unsqueeze(1)
+                ref_txt = F.normalize(ref_txt, dim=-1) if self.normalize else ref_txt
+                ref_txt_flat = ref_txt.reshape(B * k, D)
+        else:
+            ref_img, ref_txt, ref_txt_flat = img, txt, txt_flat
+
         with torch.no_grad():
             # Base positives: captions belonging to the image
             m = torch.zeros(B, B * k, dtype=torch.bool, device=img.device)
@@ -101,22 +132,27 @@ class FFFLoss(nn.Module):
             cols = torch.arange(B * k, device=img.device)
             m[rows, cols] = True
 
-            # Re-assign false negatives (Eq. 1 of the paper)
+            # Re-assign false negatives (Eq. 1 of the paper). Uses the frozen
+            # reference embeddings when provided, never the trainable ones
+            # directly — see the class docstring for why.
+            ref_s_it = torch.matmul(ref_img, ref_txt_flat.T) if use_ref else s_it
             if self.p1 < 1.0:
-                m |= s_it > self.p1
+                m |= ref_s_it > self.p1
             if self.p2 < 1.0:
-                s_ii = torch.matmul(img, img.T).repeat_interleave(k, dim=1)  # (B, B*k)
+                s_ii = torch.matmul(ref_img, ref_img.T).repeat_interleave(k, dim=1)  # (B, B*k)
                 m |= s_ii > self.p2
             if self.p3 < 1.0:
                 # Mean similarity between the k captions of image i and each
                 # caption j; dot product is linear, so this equals the dot
                 # product with the (unnormalized) mean caption embedding.
-                s_tt = torch.matmul(txt.mean(dim=1), txt_flat.T)  # (B, B*k)
-                m |= (s_tt > self.p3) & (s_it > self.p1_prime)
-            if self.p_dup < 1.0:
-                # Exact-duplicate captions are positives regardless of the
-                # image-text gate: image i matches caption j if any of image
-                # i's own captions duplicates caption j.
+                s_tt = torch.matmul(ref_txt.mean(dim=1), ref_txt_flat.T)  # (B, B*k)
+                m |= (s_tt > self.p3) & (ref_s_it > self.p1_prime)
+            if dup_mask is not None:
+                m |= dup_mask.to(m.device)
+            elif self.p_dup < 1.0:
+                # Embedding-based fallback: image i matches caption j if any
+                # of image i's own captions duplicates caption j. Prefer
+                # dup_mask — this variant drifts with the trained embeddings.
                 s_cc = torch.matmul(txt_flat, txt_flat.T)  # (B*k, B*k)
                 m |= (s_cc > self.p_dup).view(B, k, B * k).any(dim=1)
 
@@ -195,6 +231,18 @@ def test_fff_loss():
     expected_dup = -F.logsigmoid(m_ts * logits_ts).sum() / (B * k)
     assert torch.allclose(l_dup, expected_dup), f"{l_dup} != {expected_dup}"
 
+    # dup_mask (string-equality) path must match the embedding-based result
+    # for the same duplicate structure, and must win over p_dup=1.0
+    dup_mask = torch.zeros(B, B * k, dtype=torch.bool)
+    dup_mask[0, k] = True
+    dup_mask[1, 0] = True
+    l_mask = no_dup(img, txt_shared, dup_mask=dup_mask)
+    assert torch.allclose(l_mask, expected_dup), f"{l_mask} != {expected_dup}"
+
+    # default construction = pure multi-positive sigmoid (no re-assignment)
+    default_loss = FFFLoss()
+    assert default_loss.p1 == default_loss.p2 == default_loss.p3 == default_loss.p_dup == 1.0
+
     # Gradients flow to features and to the learnable scale/bias
     img_g = img.clone().requires_grad_(True)
     txt_g = txt.clone().requires_grad_(True)
@@ -203,6 +251,44 @@ def test_fff_loss():
     assert img_g.grad is not None and txt_g.grad is not None
     assert loss_fn_g.log_logit_scale.grad is not None
     assert loss_fn_g.logit_bias.grad is not None
+
+    # ref_image_features/ref_text_features: thresholds must be evaluated
+    # against the reference embeddings, not the trainable ones — construct a
+    # case where the trainable embeddings alone would NOT trigger p1, but the
+    # reference embeddings (near-identical for two different images) do.
+    torch.manual_seed(1)
+    img_r = torch.randn(B, D)
+    txt_r = torch.randn(B, k, D)
+    ref_img_r = torch.randn(B, D)
+    ref_img_r[1] = ref_img_r[0] + 1e-4 * torch.randn(D)  # ref: images 0,1 near-identical
+    ref_txt_r = torch.randn(B, k, D)  # unrelated reference text, p3 stays inactive
+
+    p1_only = FFFLoss(p1=1.0, p1_prime=1.0, p2=1.0, p3=1.0)  # p1 disabled: baseline, ref irrelevant
+    with_ref = FFFLoss(p1=0.5, p1_prime=1.0, p2=1.0, p3=1.0)
+    with_ref.load_state_dict(p1_only.state_dict())
+    l_no_ref = p1_only(img_r, txt_r)  # ref-features not needed here (p1 disabled)
+    l_with_ref = with_ref(img_r, txt_r, ref_image_features=ref_img_r, ref_text_features=ref_txt_r)
+    # Passing ref features must not change which embeddings the sigmoid loss uses
+    ref_img_n = F.normalize(ref_img_r, dim=-1)
+    ref_txt_n = F.normalize(ref_txt_r, dim=-1).reshape(B * k, D)
+    ref_s_it = ref_img_n @ ref_txt_n.T
+    assert (ref_s_it > 0.5).any(), "test setup should trigger p1 via ref embeddings"
+    f_i_r = F.normalize(img_r, dim=-1)
+    f_t_r = F.normalize(txt_r, dim=-1).reshape(B * k, D)
+    trainable_s_it = f_i_r @ f_t_r.T
+    m_ref = torch.zeros(B, B * k, dtype=torch.bool)
+    for i in range(B):
+        m_ref[i, i * k:(i + 1) * k] = True
+    m_ref |= ref_s_it > 0.5  # mask built from REFERENCE similarities
+    m_ref = m_ref.float() * 2 - 1
+    logits_r = trainable_s_it * with_ref.log_logit_scale.exp() + with_ref.logit_bias  # logits from TRAINABLE features
+    expected_ref = -F.logsigmoid(m_ref * logits_r).sum() / (B * k)
+    assert torch.allclose(l_with_ref, expected_ref), f"{l_with_ref} != {expected_ref}"
+    # sanity: using the trainable embeddings' own S_it for the p1=0.5 mask would very
+    # likely disagree with the ref-driven mask (different random embeddings) —
+    # confirms ref features, not trainable ones, actually drove the re-assignment
+    assert not torch.allclose((trainable_s_it > 0.5), (ref_s_it > 0.5)), \
+        "test setup coincidentally identical — not a meaningful check"
 
     print("k=1 siglip:", loss.item())
     print("k=3 multi-positive:", loss3.item())

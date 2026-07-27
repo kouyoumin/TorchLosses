@@ -47,7 +47,7 @@ def attention_fn(query, context, temp1):
 
 
 def local_loss(
-    img_features, sentence_embs, sentence_cnt, temp1=4.0, temp2=5.0, temp3=10.0, reduction="mean"
+    img_features, sentence_embs, sentence_cnt, temp1=4.0, temp2=5.0, temp3=10.0, reduction="mean", dup_mask=None
 ):
 
     batch_size = img_features.shape[0]
@@ -94,6 +94,12 @@ def local_loss(
 
     similarities = torch.cat(similarities, 1)  #
     similarities = similarities * temp3
+    if dup_mask is not None:
+        # Exclude exact-duplicate (image, sentence-set) pairs from negatives.
+        # dup_mask: (batch, batch) bool, True where texts i and j are the same
+        # string but i != j (symmetric), so one masked_fill covers both CE
+        # directions after the transpose.
+        similarities = similarities.masked_fill(dup_mask.to(similarities.device), -1e4)
     similarities1 = similarities.transpose(0, 1)  # [batch, batch]
 
     labels = torch.LongTensor(range(batch_size)).to(similarities.device)
@@ -104,7 +110,7 @@ def local_loss(
 
 
 class GloriaLocalLoss(nn.Module):
-    def __init__(self, temp1=4.0, temp2=5.0, temp3=10.0, reduction="mean", train_temp=False):
+    def __init__(self, temp1=4.0, temp2=5.0, temp3=10.0, reduction="mean", train_temp=False, dedup=False):
         super(GloriaLocalLoss, self).__init__()
         self.train_temp = train_temp
         if train_temp:
@@ -116,8 +122,11 @@ class GloriaLocalLoss(nn.Module):
             self.temp2 = temp2
             self.temp3 = temp3
         self.reduction = reduction
+        # dedup: caller passes dup_mask (exact-duplicate text pairs, string
+        # equality) to exclude them from the batch negatives
+        self.dedup = dedup
 
-    def __call__(self, img_features, sentence_embs, sentence_cnt):
+    def __call__(self, img_features, sentence_embs, sentence_cnt, dup_mask=None):
         return local_loss(
             img_features,
             sentence_embs,
@@ -126,4 +135,5 @@ class GloriaLocalLoss(nn.Module):
             temp2=self.temp2,
             temp3=self.temp3,
             reduction=self.reduction,
+            dup_mask=dup_mask,
         )
