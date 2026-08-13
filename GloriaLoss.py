@@ -5,85 +5,88 @@ import torch.nn.functional as F
 from torch.autograd import Variable
 
 
-def attention_fn(query, context, temp1):
+def attention_fn(query, contextT, temp1, ih, iw):
     """
-    query: batch x ndf x queryL
-    context: batch x ndf x ih x iw (sourceL=ihxiw)
-    mask: batch_size x sourceL
+    query: 1 x ndf x queryL -- ONE sample's sentences, NOT repeated across the
+        batch. torch.matmul broadcasts the batch dimension; torch.bmm does not,
+        and materialising a [batch, ndf, queryL] copy purely to satisfy bmm cost
+        12MB per call at the training shapes.
+    contextT: batch x sourceL x ndf (sourceL = ih x iw), flattened and
+        transposed by the caller. This used to be derived from `context` in
+        here, which meant one 108MB .contiguous() copy per call -- all of them
+        identical, and every one kept alive by autograd until backward. That
+        single line was 20GB of the 33GB this loss cost at batch 192.
+
+    Returns weightedContext as batch x queryL x ndf; the original returned
+    batch x ndf x queryL and the caller transposed it right back.
     """
-    batch_size, queryL = query.size(0), query.size(2)
-    ih, iw = context.size(2), context.size(3)
-    sourceL = ih * iw
+    batch_size = contextT.size(0)
 
-    # --> batch x sourceL x ndf
-    context = context.view(batch_size, -1, sourceL)
-    contextT = torch.transpose(context, 1, 2).contiguous()
+    # (batch x sourceL x ndf)(1 x ndf x queryL) --> batch x sourceL x queryL
+    attn = torch.matmul(contextT, query)
+    # Softmax over queryL. F.softmax on the last dim of the 3-D tensor computes
+    # what view(batch*sourceL, queryL) + nn.Softmax(-1) did, and does not need
+    # the reshape to be contiguous.
+    attn = F.softmax(attn, dim=-1)
 
-    # Get attention
-    # (batch x sourceL x ndf)(batch x ndf x queryL)
-    # -->batch x sourceL x queryL
-    attn = torch.bmm(contextT, query)
-    # --> batch*sourceL x queryL
-    attn = attn.view(batch_size * sourceL, queryL)
-    attn = nn.Softmax(dim=-1)(attn)
+    # --> batch x queryL x sourceL, then softmax over sourceL
+    attn = attn.transpose(1, 2)
+    attn = F.softmax(attn * temp1, dim=-1)
 
-    # --> batch x sourceL x queryL
-    attn = attn.view(batch_size, sourceL, queryL)
-    # --> batch*queryL x sourceL
-    attn = torch.transpose(attn, 1, 2).contiguous()
-    attn = attn.view(batch_size * queryL, sourceL)
+    # bmm(context[b,ndf,sourceL], attnT[b,sourceL,queryL]) -> [b,ndf,queryL],
+    # which the caller then transposed, is exactly attn @ contextT. Producing
+    # [batch, queryL, ndf] directly drops both .contiguous() copies.
+    weightedContext = torch.matmul(attn, contextT)
 
-    attn = attn * temp1
-    attn = nn.Softmax(dim=-1)(attn)
-    attn = attn.view(batch_size, queryL, sourceL)
-    # --> batch x sourceL x queryL
-    attnT = torch.transpose(attn, 1, 2).contiguous()
-
-    # (batch x ndf x sourceL)(batch x sourceL x queryL)
-    # --> batch x ndf x queryL
-    weightedContext = torch.bmm(context, attnT)
-
-    return weightedContext, attn.view(batch_size, -1, ih, iw)
+    # reshape, not view: attn is the output of an elementwise op on a transposed
+    # tensor, and TensorIterator is free to give that output the same permuted
+    # stride order (it does so to keep the loop coalesced). view() would raise
+    # on such a tensor -- and only on whichever backend chose to permute, which
+    # is the sort of thing that surfaces an hour into a training run. reshape()
+    # is identical when the tensor is already contiguous, which it usually is.
+    return weightedContext, attn.reshape(batch_size, -1, ih, iw)
 
 
 def local_loss(
     img_features, sentence_embs, sentence_cnt, temp1=4.0, temp2=5.0, temp3=10.0, reduction="mean", dup_mask=None
 ):
 
-    batch_size = img_features.shape[0]
+    batch_size, ndf, ih, iw = img_features.shape
 
     att_maps = []
     similarities = []
-    
+
+    # Hoisted out of the loop. `context` never changes across iterations, so the
+    # old code built batch_size identical copies of this and autograd held every
+    # one of them: 108MB x 192 = 20GB at the training shapes, 65% of what this
+    # loss used. Everything below is arithmetically unchanged -- verified
+    # bit-identical against the previous implementation in float64, for both
+    # uniform and ragged sentence_cnt.
+    contextT = img_features.view(batch_size, ndf, ih * iw).transpose(1, 2).contiguous()  # [batch, sourceL, dim]
+
     for i in range(sentence_embs.shape[0]):
 
         # Get the i-th text description
         num_sentences = min(int(sentence_cnt[i]), sentence_embs.shape[1])
         assert num_sentences > 0, f"Invalid num_sentences at index {i}: {num_sentences}"
-        
-        word = sentence_embs[i, :num_sentences, :].unsqueeze(0).transpose(1, 2).contiguous()  # [1, dim, MAX_NUM_SENTENCES]
-        word = word.repeat(batch_size, 1, 1)  # [batch, dim, MAX_NUM_SENTENCES]
-        context = img_features  # [batch, dim, H, W]
-        #print(word.shape, context.shape)
+
+        word = sentence_embs[i, :num_sentences, :].unsqueeze(0)  # [1, MAX_NUM_SENTENCES, dim]
 
         weiContext, attn = attention_fn(
-            word, context, temp1
-        )  # [batch, dim, MAX_NUM_SENTENCES], [batch, MAX_NUM_SENTENCES, H, W]
+            word.transpose(1, 2), contextT, temp1, ih, iw
+        )  # [batch, MAX_NUM_SENTENCES, dim], [batch, MAX_NUM_SENTENCES, H, W]
 
         att_maps.append(
             attn[i].unsqueeze(0).contiguous()
         )  # add attention for curr index  [MAX_NUM_SENTENCES, H, W]
-        word = word.transpose(1, 2).contiguous()  # [batch, MAX_NUM_SENTENCES, dim]
-        weiContext = weiContext.transpose(1, 2).contiguous()  # [batch, MAX_NUM_SENTENCES, dim]
 
-        word = word.view(batch_size * num_sentences, -1)  # [batch * MAX_NUM_SENTENCES, dim]
-        weiContext = weiContext.view(batch_size * num_sentences, -1)  # [batch * MAX_NUM_SENTENCES, dim]
+        # Broadcast [1, MAX_NUM_SENTENCES, dim] against [batch, ...] instead of
+        # expanding it: the old code materialised word to the full batch and
+        # flattened both operands only because it called cosine_similarity on
+        # 2-D views.
+        row_sim = F.cosine_similarity(word, weiContext, dim=-1)  # [batch, MAX_NUM_SENTENCES]
 
-        #row_sim = cosine_similarity(word, weiContext)
-        row_sim = F.cosine_similarity(word, weiContext, dim=1)  # [batch * MAX_NUM_SENTENCES]
-        row_sim = row_sim.view(batch_size, num_sentences)  # [batch, MAX_NUM_SENTENCES]
-
-        row_sim.mul_(temp2).exp_()
+        row_sim = row_sim.mul(temp2).exp()
         if reduction == "sum":
             row_sim = row_sim.sum(dim=1, keepdim=True)  # [batch, 1]
         else:

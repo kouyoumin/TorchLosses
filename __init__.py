@@ -10,4 +10,5 @@ from .IoULoss import *
 from .MRL import *
 from .OHEM import *
 from .SIGRegLoss import *
+from .VISRegLoss import *
 from .WeightedMultiLoss import *

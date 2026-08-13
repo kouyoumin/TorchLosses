@@ -4,9 +4,12 @@ import torch.nn as nn
 
 class SIGRegLoss(nn.Module):
 
-    def __init__(self, knots=17, num_proj=64):
+    def __init__(self, knots=17, num_proj=256):
         """
-        Sketched Isotropic Gaussian Regularization (SIGReg) loss.
+        Sketched Isotropic Gaussian Regularization (SIGReg) loss, from LeJEPA.
+        Reference implementation:
+        https://github.com/galilai-group/lejepa/blob/main/MINIMAL.md
+        The defaults below match it: 17 knots over t in [0, 3], 256 projections.
 
         Pushes the embedding distribution toward an isotropic standard Gaussian
         by comparing the empirical characteristic function of random 1D projections

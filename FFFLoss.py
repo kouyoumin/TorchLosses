@@ -23,13 +23,25 @@ class FFFLoss(nn.Module):
                 logit_scale=4.35,   # paper/SigLIP init: 10
                 logit_bias=-4.24,   # paper/SigLIP init: -10
                 # Similarity-threshold re-assignment is DISABLED by default
-                # (1.0). The paper computes these matrices with a FROZEN
-                # pretrained model; computing them online from the model
-                # being trained creates a positive feedback loop (drift ->
-                # more re-assignments -> collapse). Only enable them if the
-                # embeddings passed in come from a frozen reference model.
-                # Paper values: p1=0.27, p1'=0.24, p2=0.92, p3=0.99;
-                # M2R_FRONTAL/epoch25 calibration: 0.768/0.712/0.848/0.9.
+                # (1.0). Two independent reasons, either of which is sufficient:
+                #
+                # 1. The paper computes these matrices with a FROZEN pretrained
+                #    model; computing them online from the model being trained
+                #    creates a positive feedback loop (drift -> more
+                #    re-assignments -> collapse). Pass ref_image_features /
+                #    ref_text_features from a frozen or EMA reference.
+                # 2. On M2R_FRONTAL/epoch25 the thresholds have no usable
+                #    operating point at all, frozen reference or not.
+                #    FFFThresholdCalibration.py over 43.3M candidate pairs found
+                #    no threshold reaching 90% precision for any of p1/p2/p3: on
+                #    the residual that dup_mask does not already cover, the mean
+                #    positive similarity sits at or below the negatives' 99th
+                #    percentile. p1 and p2 could not even recover the
+                #    string-identical pairs.
+                #
+                # Paper values (p1=0.27, p1'=0.24, p2=0.92, p3=0.99) are an
+                # operating point on a different encoder and do not transfer --
+                # re-calibrate per checkpoint rather than copying any number.
                 p1=1.0,
                 p1_prime=1.0,
                 p2=1.0,
@@ -90,12 +102,23 @@ class FFFLoss(nn.Module):
                 i. Marked positive unconditionally. Preferred over p_dup
                 because it does not depend on the embeddings being trained.
             ref_image_features, ref_text_features: optional embeddings from a
-                FROZEN reference model (same shapes as image_features/
-                text_features), used instead of the trainable embeddings to
-                compute the p1/p1_prime/p2/p3 similarity-threshold masks.
-                Required to safely enable those thresholds (see class
-                docstring) — pass both or neither. The sigmoid loss itself
-                still uses the trainable image_features/text_features.
+                reference model that is NOT the weights being trained (same
+                shapes as image_features/text_features), used instead of the
+                trainable embeddings to compute the p1/p1_prime/p2/p3
+                similarity-threshold masks. Required to safely enable those
+                thresholds (see class docstring) — pass both or neither. The
+                sigmoid loss itself still uses the trainable image_features/
+                text_features.
+                Either a frozen copy or a slow-moving average (EMA) works: the
+                requirement is that the reference cannot respond to this step's
+                gradient, which is what closes the drift -> re-assignment ->
+                collapse loop. An EMA lags by roughly 1/(1-decay) steps, so it
+                keeps improving with training instead of going stale, but it
+                gives weaker protection than a frozen copy early on, when the
+                average is still close to the live weights.
+                Both must come from the SAME snapshot — an image tower and a
+                text tower of different ages are not in a shared embedding
+                space, and p1/p1_prime compare one against the other.
         """
         if text_features.ndim == 2:
             text_features = text_features.unsqueeze(1)
