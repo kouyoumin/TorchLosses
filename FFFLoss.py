@@ -47,6 +47,7 @@ class FFFLoss(nn.Module):
                 p2=1.0,
                 p3=1.0,
                 p_dup=1.0,          # embedding-based duplicates (superseded by dup_mask)
+                soft_dup_weight=0.0,
                 reduction='mean'):
         """
         Args:
@@ -66,6 +67,17 @@ class FFFLoss(nn.Module):
                 similarity. Ignored when a `dup_mask` is passed to forward()
                 (the preferred, collapse-proof way: string equality computed
                 by the caller). Set to 1.0 to disable.
+            soft_dup_weight: how much of a NEGATIVE a soft duplicate still
+                counts as, in [0, 1] -- the same knob as
+                ContrastiveLoss.soft_dup_weight, so one CLI flag can drive
+                both. Soft duplicates are marked by `soft_dup_mask` in
+                forward() and are meant for related-but-not-identical pairs
+                (e.g. same abnormal findings, different normal ones). This
+                loss is a sigmoid/BCE loss, not a softmax one, so a partial
+                negative is expressed as a partial LABEL: target = 1 - w.
+                w = 0 therefore reproduces the hard `dup_mask` behaviour
+                (target 1, a full positive) and w = 1 leaves the pair an
+                ordinary negative (target 0).
             reduction: 'mean' | 'sum' | 'none'. 'mean' follows the paper
                 (sum over all pairs divided by N_txt); 'none' returns
                 per-image losses of shape (B,) whose mean equals 'mean'.
@@ -79,6 +91,7 @@ class FFFLoss(nn.Module):
         self.p2 = p2
         self.p3 = p3
         self.p_dup = p_dup
+        self.soft_dup_weight = float(soft_dup_weight)
         self.reduction = reduction
 
     @property
@@ -90,7 +103,8 @@ class FFFLoss(nn.Module):
         return 1. / self.logit_scale
 
     def forward(self, image_features, text_features, dup_mask=None,
-                ref_image_features=None, ref_text_features=None):
+                ref_image_features=None, ref_text_features=None,
+                soft_dup_mask=None):
         """
         Args:
             image_features: (B, D) image embeddings.
@@ -101,6 +115,11 @@ class FFFLoss(nn.Module):
                 an exact duplicate (string equality) of any caption of image
                 i. Marked positive unconditionally. Preferred over p_dup
                 because it does not depend on the embeddings being trained.
+            soft_dup_mask: optional (B, B*k) bool tensor of PARTIAL duplicates,
+                given the target 1 - soft_dup_weight instead of 0. Entries that
+                are already positive (the image's own captions, dup_mask, a
+                threshold re-assignment) keep target 1 -- a soft mark can only
+                lift a negative part-way, never demote a positive.
             ref_image_features, ref_text_features: optional embeddings from a
                 reference model that is NOT the weights being trained (same
                 shapes as image_features/text_features), used instead of the
@@ -179,9 +198,33 @@ class FFFLoss(nn.Module):
                 s_cc = torch.matmul(txt_flat, txt_flat.T)  # (B*k, B*k)
                 m |= (s_cc > self.p_dup).view(B, k, B * k).any(dim=1)
 
-            m = m.float() * 2 - 1  # {-1, +1}
+            if soft_dup_mask is not None and self.soft_dup_weight <= 0.0:
+                # w = 0 is exactly a hard duplicate; folding it in here keeps
+                # the fast +/-1 path below for the common case. Deliberately
+                # AFTER the dup_mask/p_dup chain above -- slotting it in as
+                # another branch of that if/elif would have let p_dup fire in
+                # cases where dup_mask already covered the pairs.
+                m |= soft_dup_mask.to(m.device)
+                soft_dup_mask = None
 
-        loss = -F.logsigmoid(m * logits)  # (B, B*k)
+            if soft_dup_mask is None or self.soft_dup_weight >= 1.0:
+                m = m.float() * 2 - 1  # {-1, +1}
+                target = None
+            else:
+                # Soft labels. -logsigmoid(m*z) with m in {-1,+1} IS binary
+                # cross-entropy with target in {0,1}, so writing it out in BCE
+                # form generalises to a fractional target without changing any
+                # existing result: target 1 -> -logsigmoid(z), target 0 ->
+                # -logsigmoid(-z), both exactly as before.
+                target = m.float()
+                target = torch.where(soft_dup_mask.to(m.device) & ~m,
+                                     torch.full_like(target, 1.0 - self.soft_dup_weight),
+                                     target)
+
+        if target is None:
+            loss = -F.logsigmoid(m * logits)  # (B, B*k)
+        else:
+            loss = -(target * F.logsigmoid(logits) + (1 - target) * F.logsigmoid(-logits))
 
         if self.reduction == 'mean':
             return loss.sum() / (B * k)
@@ -317,6 +360,55 @@ def test_fff_loss():
     print("k=3 multi-positive:", loss3.item())
 
 
+def test_fff_soft_dup():
+    """A soft duplicate is a fractional label, and w=0 / w=1 hit the two ends."""
+    torch.manual_seed(0)
+    B, k, D, w = 3, 2, 16, 0.25
+    img = torch.randn(B, D)
+    txt = torch.randn(B, k, D)
+    soft = torch.zeros(B, B * k, dtype=torch.bool)
+    soft[0, k:2 * k] = True          # image 0 shares its abnormal findings with study 1
+    soft[1, :k] = True
+
+    def logits_of(fn):
+        f_i = F.normalize(img, dim=-1)
+        f_t = F.normalize(txt, dim=-1).reshape(B * k, D)
+        return f_i @ f_t.T * fn.logit_scale + fn.logit_bias
+
+    fn = FFFLoss(p1=1.0, p1_prime=1.0, p2=1.0, p3=1.0, p_dup=1.0, soft_dup_weight=w)
+    loss = fn(img, txt, soft_dup_mask=soft)
+
+    z = logits_of(fn)
+    pos = torch.zeros(B, B * k, dtype=torch.bool)
+    pos[torch.arange(B).repeat_interleave(k), torch.arange(B * k)] = True
+    target = torch.where(soft & ~pos, torch.full_like(z, 1.0 - w), pos.float())
+    expected = -(target * F.logsigmoid(z) + (1 - target) * F.logsigmoid(-z))
+    expected = expected.sum() / (B * k)
+    assert torch.allclose(loss, expected), f"{loss} != {expected}"
+
+    # w = 0 -> identical to passing the same mask as a hard dup_mask
+    hard0 = FFFLoss(p1=1.0, p1_prime=1.0, p2=1.0, p3=1.0, p_dup=1.0, soft_dup_weight=0.0)
+    hard1 = FFFLoss(p1=1.0, p1_prime=1.0, p2=1.0, p3=1.0, p_dup=1.0)
+    assert torch.allclose(hard0(img, txt, soft_dup_mask=soft),
+                          hard1(img, txt, dup_mask=soft))
+
+    # w = 1 -> the soft pairs are ordinary negatives, i.e. no mask at all
+    off = FFFLoss(p1=1.0, p1_prime=1.0, p2=1.0, p3=1.0, p_dup=1.0, soft_dup_weight=1.0)
+    assert torch.allclose(off(img, txt, soft_dup_mask=soft), hard1(img, txt))
+
+    # A soft mark never demotes a real positive: the diagonal block is untouched
+    self_soft = pos.clone()
+    assert torch.allclose(fn(img, txt, soft_dup_mask=self_soft), hard1(img, txt))
+
+    # and the loss must sit between the two extremes it interpolates
+    lo = hard0(img, txt, soft_dup_mask=soft).item()   # fully positive
+    hi = off(img, txt, soft_dup_mask=soft).item()     # fully negative
+    assert min(lo, hi) <= loss.item() <= max(lo, hi), f"{lo} {loss.item()} {hi}"
+
+    print("FFF soft dup tests passed")
+
+
 if __name__ == "__main__":
     test_fff_loss()
+    test_fff_soft_dup()
     print("FFFLoss test passed.")

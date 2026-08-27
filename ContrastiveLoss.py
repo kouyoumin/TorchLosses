@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,6 +14,7 @@ class ContrastiveLoss(nn.Module):
                 false_negative_threshold=0.98,
                 queue_size=4096,
                 dedup=False,
+                soft_dup_weight=0.0,
                 reduction='mean'):
         """
         Args:
@@ -29,6 +32,18 @@ class ContrastiveLoss(nn.Module):
                 from the negatives — both within the batch and against the
                 queue (queue entries remember their text id). Removes exact
                 false negatives without relying on the trained embeddings.
+            soft_dup_weight: how much of a negative a SOFT duplicate still
+                counts as, in [0, 1]. Soft duplicates are marked by a second id
+                vector (soft_dup_ids) and are meant for pairs that are related
+                rather than identical -- e.g. two studies with the same abnormal
+                findings but different normal ones. 0 drops them exactly like a
+                hard duplicate, 1 leaves them as ordinary negatives.
+
+                Weighting one term of the InfoNCE denominator by w is exactly a
+                logit shift of -log(w), since w*exp(s) == exp(s - (-log w)), so
+                that is how it is implemented. The shift applies to logits that
+                have ALREADY been divided by the temperature, which is why w
+                needs no retuning when the temperature moves (or is learned).
             reduction: 'mean' | 'sum' | 'none'.  Use 'none' to get per-sample
                 losses of shape (B,) for use with OHEM wrappers.
         """
@@ -40,6 +55,7 @@ class ContrastiveLoss(nn.Module):
         self.log_temperature = nn.Parameter(log_temperature) if train_temp else log_temperature
         self.queue_size = queue_size
         self.dedup = dedup
+        self.soft_dup_weight = float(soft_dup_weight)
         self.reduction = reduction
         # Registered as buffers so .to()/.cuda() move the queue with the module.
         # persistent=False: the queue holds embeddings produced by whatever the
@@ -48,6 +64,7 @@ class ContrastiveLoss(nn.Module):
         # state_dict() therefore stays {log_temperature}, as before.
         self.register_buffer('_queue', None, persistent=False)
         self.register_buffer('_queue_ids', None, persistent=False)
+        self.register_buffer('_queue_soft_ids', None, persistent=False)
         self._queue_ptr = 0
         self._queue_filled = 0
 
@@ -55,29 +72,39 @@ class ContrastiveLoss(nn.Module):
     def temperature(self):
         return self.log_temperature.exp().clamp(0.01, 0.5)
 
-    def _enqueue(self, embeddings: torch.Tensor, ids: torch.Tensor | None = None):
+    def _enqueue(self, embeddings: torch.Tensor, ids: torch.Tensor | None = None,
+                 soft_ids: torch.Tensor | None = None):
         B, D = embeddings.shape
         if self._queue is None:
             # fp32 regardless of the embedding dtype; cast back on read
             self._queue = torch.zeros(self.queue_size, D, dtype=torch.float32, device=embeddings.device)
         if ids is not None and self._queue_ids is None:
             self._queue_ids = torch.zeros(self.queue_size, dtype=torch.int64, device=embeddings.device)
+        if soft_ids is not None and self._queue_soft_ids is None:
+            self._queue_soft_ids = torch.zeros(self.queue_size, dtype=torch.int64, device=embeddings.device)
         end = self._queue_ptr + B
-        if end <= self.queue_size:
-            self._queue[self._queue_ptr:end] = embeddings
-            if ids is not None:
-                self._queue_ids[self._queue_ptr:end] = ids
-        else:
-            first = self.queue_size - self._queue_ptr
-            self._queue[self._queue_ptr:] = embeddings[:first]
-            self._queue[:B - first] = embeddings[first:]
-            if ids is not None:
-                self._queue_ids[self._queue_ptr:] = ids[:first]
-                self._queue_ids[:B - first] = ids[first:]
+
+        # One ring-buffer write, applied to the embeddings and to each id vector
+        # that is being tracked. Written once rather than per buffer: the two id
+        # queues must wrap at exactly the same point as the embedding queue or a
+        # row's id stops describing the row.
+        def _write(dst, src):
+            if dst is None:
+                return
+            if end <= self.queue_size:
+                dst[self._queue_ptr:end] = src
+            else:
+                first = self.queue_size - self._queue_ptr
+                dst[self._queue_ptr:] = src[:first]
+                dst[:B - first] = src[first:]
+
+        _write(self._queue, embeddings)
+        _write(self._queue_ids if ids is not None else None, ids)
+        _write(self._queue_soft_ids if soft_ids is not None else None, soft_ids)
         self._queue_ptr = end % self.queue_size
         self._queue_filled = min(self._queue_filled + B, self.queue_size)
 
-    def __call__(self, feature1, feature2, dup_ids=None):
+    def __call__(self, feature1, feature2, dup_ids=None, soft_dup_ids=None):
         """
         Args:
             feature1: (B, D) image embeddings.
@@ -86,6 +113,11 @@ class ContrastiveLoss(nn.Module):
                 (e.g. hash of the report string). Samples sharing an id are
                 exact text duplicates: they are excluded from each other's
                 negatives, and queue entries with the same id are excluded too.
+            soft_dup_ids: optional (B,) int64 tensor of a SECOND, coarser
+                identity (e.g. the abnormal findings alone). Samples sharing one
+                keep only self.soft_dup_weight of their weight as negatives
+                instead of being dropped outright. Ignored when the weight is 1;
+                identical to dup_ids when it is 0.
         """
         if self.normalize:
             f1 = F.normalize(feature1, dim=1)
@@ -112,8 +144,23 @@ class ContrastiveLoss(nn.Module):
             dup_mask = (dup_ids.view(-1, 1) == dup_ids.view(1, -1)) & ~eye
             fn_mask = dup_mask if fn_mask is None else (fn_mask | dup_mask)
 
+        # Soft duplicates: down-weighted rather than removed. w == 0 is the hard
+        # mask (fold it in, so -log(0) never has to be represented) and w >= 1
+        # leaves them as ordinary negatives, so only 0 < w < 1 needs the shift.
+        soft_mask = None
+        soft_penalty = 0.0
+        if soft_dup_ids is not None and self.soft_dup_weight < 1.0:
+            soft_dup_ids = soft_dup_ids.to(f1.device)
+            soft_mask = (soft_dup_ids.view(-1, 1) == soft_dup_ids.view(1, -1)) & ~eye
+            if self.soft_dup_weight <= 0.0:
+                fn_mask = soft_mask if fn_mask is None else (fn_mask | soft_mask)
+                soft_mask = None
+            else:
+                soft_penalty = -math.log(self.soft_dup_weight)
+
         # --- image → text (with queue for extra negatives) ---
         queue_mask = None
+        soft_queue_mask = None
         if self.queue_size > 0 and self._queue is not None and self._queue_filled > 0:
             # The queue is kept in fp32; read it back in the embedding dtype so
             # torch.cat below does not silently promote the whole logit matrix
@@ -123,10 +170,20 @@ class ContrastiveLoss(nn.Module):
             if dup_ids is not None and self._queue_ids is not None:
                 queue_ids = self._queue_ids[:self._queue_filled].to(f1.device)
                 queue_mask = dup_ids.view(-1, 1) == queue_ids.view(1, -1)  # B x K
+            if soft_dup_ids is not None and self._queue_soft_ids is not None and self.soft_dup_weight < 1.0:
+                q_soft_ids = self._queue_soft_ids[:self._queue_filled].to(f1.device)
+                q_soft = soft_dup_ids.view(-1, 1) == q_soft_ids.view(1, -1)  # B x K
+                if self.soft_dup_weight <= 0.0:
+                    queue_mask = q_soft if queue_mask is None else (queue_mask | q_soft)
+                else:
+                    soft_queue_mask = q_soft
         else:
             all_f2 = f2
 
         logits_a = torch.matmul(f1, all_f2.T) / temperature  # B x (B+K)
+        # Soft first, hard second: a pair that is both stays fully masked.
+        if soft_mask is not None:
+            logits_a[:, :B] = logits_a[:, :B] - soft_penalty * soft_mask.to(logits_a.dtype)
         if fn_mask is not None:
             logits_a[:, :B] = logits_a[:, :B].masked_fill(fn_mask, -1e4)
 
@@ -149,6 +206,8 @@ class ContrastiveLoss(nn.Module):
                 q_fn_mask = (logits_a[:, B:] * temperature) > self.false_negative_threshold
             queue_mask = q_fn_mask if queue_mask is None else (queue_mask | q_fn_mask)
 
+        if soft_queue_mask is not None:
+            logits_a[:, B:] = logits_a[:, B:] - soft_penalty * soft_queue_mask.to(logits_a.dtype)
         if queue_mask is not None:
             logits_a[:, B:] = logits_a[:, B:].masked_fill(queue_mask, -1e4)
         labels_a = torch.arange(B, device=f1.device)
@@ -156,6 +215,8 @@ class ContrastiveLoss(nn.Module):
 
         # --- text → image (current batch only) ---
         logits_b = torch.matmul(f2, f1.T) / temperature      # B x B
+        if soft_mask is not None:
+            logits_b = logits_b - soft_penalty * soft_mask.T.to(logits_b.dtype)
         if fn_mask is not None:
             logits_b = logits_b.masked_fill(fn_mask.T, -1e4)
         labels_b = torch.arange(B, device=f2.device)
@@ -163,7 +224,9 @@ class ContrastiveLoss(nn.Module):
 
         # Enqueue current text embeddings after loss is computed
         if self.queue_size > 0:
-            self._enqueue(f2.detach(), dup_ids.detach() if dup_ids is not None else None)
+            self._enqueue(f2.detach(),
+                          dup_ids.detach() if dup_ids is not None else None,
+                          soft_dup_ids.detach() if soft_dup_ids is not None else None)
 
         per_sample = (loss_a + loss_b) / 2  # (B,)
         if self.reduction == 'mean':
@@ -241,6 +304,68 @@ def test_dedup():
     assert torch.allclose(loss_q, expected_q), f"{loss_q} != {expected_q}"
 
     print("dedup tests passed")
+
+
+def test_soft_dedup():
+    """Soft duplicates are down-weighted negatives, not dropped ones."""
+    torch.manual_seed(0)
+    B, D, w = 4, 16, 0.25
+    f1, f2 = torch.randn(B, D), torch.randn(B, D)
+    hard = torch.tensor([1, 2, 3, 4])              # no exact duplicates
+    soft = torch.tensor([10, 10, 20, 20])          # 0~1 and 2~3 share abnormal findings
+
+    loss_fn = ContrastiveLoss(temperature=0.2, false_negative_threshold=1.0,
+                              queue_size=0, dedup=True, soft_dup_weight=w)
+    loss = loss_fn(f1, f2, dup_ids=hard, soft_dup_ids=soft)
+
+    n1, n2 = F.normalize(f1, dim=1), F.normalize(f2, dim=1)
+    t = loss_fn.temperature
+    m = (soft.view(-1, 1) == soft.view(1, -1)) & ~torch.eye(B, dtype=torch.bool)
+    shift = -math.log(w) * m.float()
+    labels = torch.arange(B)
+    expected = (F.cross_entropy(n1 @ n2.T / t - shift, labels)
+                + F.cross_entropy(n2 @ n1.T / t - shift.T, labels)) / 2
+    assert torch.allclose(loss, expected), f"{loss} != {expected}"
+
+    # The shift really is "counts as w of a negative": the denominator of the
+    # image->text term must equal exp(pos) + w * sum(exp(soft)) + sum(exp(rest)).
+    row = 0
+    logits = (n1 @ n2.T / t)[row]
+    denom_direct = logits.exp().mul(torch.where(m[row], torch.tensor(w), torch.ones(B))).sum()
+    denom_shift = (logits - shift[row]).exp().sum()
+    assert torch.allclose(denom_direct, denom_shift), f"{denom_direct} != {denom_shift}"
+
+    # w = 0 is exactly the hard mask; w = 1 is exactly no dedup at all
+    hard_equiv = ContrastiveLoss(temperature=0.2, false_negative_threshold=1.0,
+                                 queue_size=0, dedup=True, soft_dup_weight=0.0)
+    as_hard = ContrastiveLoss(temperature=0.2, false_negative_threshold=1.0,
+                              queue_size=0, dedup=True)
+    assert torch.allclose(hard_equiv(f1, f2, dup_ids=hard, soft_dup_ids=soft),
+                          as_hard(f1, f2, dup_ids=soft))
+    off = ContrastiveLoss(temperature=0.2, false_negative_threshold=1.0,
+                          queue_size=0, dedup=True, soft_dup_weight=1.0)
+    assert torch.allclose(off(f1, f2, dup_ids=hard, soft_dup_ids=soft),
+                          as_hard(f1, f2, dup_ids=hard))
+
+    # Queue entries carry their soft id too and are shifted, not masked
+    q = ContrastiveLoss(temperature=0.2, false_negative_threshold=1.0,
+                        queue_size=8, dedup=True, soft_dup_weight=w)
+    q(f1, f2, dup_ids=hard, soft_dup_ids=soft)     # fills the queue
+    g1, g2 = torch.randn(B, D), torch.randn(B, D)
+    g_hard = torch.tensor([5, 6, 7, 8])
+    g_soft = torch.tensor([10, 99, 99, 99])        # row 0 matches two queued rows
+    loss_q = q(g1, g2, dup_ids=g_hard, soft_dup_ids=g_soft)
+    m1, m2 = F.normalize(g1, dim=1), F.normalize(g2, dim=1)
+    all2 = torch.cat([m2, F.normalize(f2, dim=1)], dim=0)
+    la = m1 @ all2.T / t
+    m_batch = (g_soft.view(-1, 1) == g_soft.view(1, -1)) & ~torch.eye(B, dtype=torch.bool)
+    la[:, :B] = la[:, :B] - (-math.log(w)) * m_batch.float()
+    la[:, B:] = la[:, B:] - (-math.log(w)) * (g_soft.view(-1, 1) == soft.view(1, -1)).float()
+    lb = m2 @ m1.T / t - (-math.log(w)) * m_batch.T.float()
+    expected_q = (F.cross_entropy(la, labels) + F.cross_entropy(lb, labels)) / 2
+    assert torch.allclose(loss_q, expected_q), f"{loss_q} != {expected_q}"
+
+    print("soft dedup tests passed")
 
 
 def test_queue_false_negative_threshold():
@@ -330,6 +455,7 @@ def test_queue_buffers():
 if __name__ == "__main__":
     test_contrastive_loss()
     test_dedup()
+    test_soft_dedup()
     test_queue_false_negative_threshold()
     test_queue_buffers()
     print("ContrastiveLoss test passed.")
