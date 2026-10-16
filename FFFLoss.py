@@ -48,6 +48,7 @@ class FFFLoss(nn.Module):
                 p3=1.0,
                 p_dup=1.0,          # embedding-based duplicates (superseded by dup_mask)
                 soft_dup_weight=0.0,
+                max_logit_scale=None,   # None/0 = uncapped (the behaviour before the cap existed)
                 reduction='mean'):
         """
         Args:
@@ -78,6 +79,16 @@ class FFFLoss(nn.Module):
                 w = 0 therefore reproduces the hard `dup_mask` behaviour
                 (target 1, a full positive) and w = 1 leaves the pair an
                 ordinary negative (target 0).
+            max_logit_scale: optional upper bound on the learnable logit
+                scale. None or 0 leaves it uncapped. Enforced by clamping the
+                PARAMETER in place at the start of every forward (CLIP's
+                arrangement), not by clamping the value inside the graph: a
+                graph clamp has zero gradient above the cap, so a scale that
+                arrives there -- or is restored from a checkpoint already past
+                it -- could never come back down even when the loss wanted it
+                to. Clamping the parameter keeps the gradient live in both
+                directions and makes the stored value, the logged value and
+                the value the loss uses one and the same.
             reduction: 'mean' | 'sum' | 'none'. 'mean' follows the paper
                 (sum over all pairs divided by N_txt); 'none' returns
                 per-image losses of shape (B,) whose mean equals 'mean'.
@@ -92,7 +103,21 @@ class FFFLoss(nn.Module):
         self.p3 = p3
         self.p_dup = p_dup
         self.soft_dup_weight = float(soft_dup_weight)
+        self.max_logit_scale = float(max_logit_scale) if max_logit_scale else None
+        if self.max_logit_scale is not None and self.max_logit_scale <= 0:
+            raise ValueError(f'max_logit_scale must be positive, got {max_logit_scale}')
+        if self.max_logit_scale is not None and logit_scale > self.max_logit_scale:
+            raise ValueError(f'initial logit_scale {logit_scale} exceeds max_logit_scale '
+                             f'{self.max_logit_scale}')
         self.reduction = reduction
+
+    @torch.no_grad()
+    def clamp_logit_scale_(self):
+        """Pull the logit scale down to `max_logit_scale` if it is above it.
+        A no-op when uncapped. Called by forward(); callers that restore a
+        state dict call it too, so what they log is what training will use."""
+        if self.max_logit_scale is not None:
+            self.log_logit_scale.clamp_(max=math.log(self.max_logit_scale))
 
     @property
     def logit_scale(self):
@@ -139,6 +164,7 @@ class FFFLoss(nn.Module):
                 text tower of different ages are not in a shared embedding
                 space, and p1/p1_prime compare one against the other.
         """
+        self.clamp_logit_scale_()
         if text_features.ndim == 2:
             text_features = text_features.unsqueeze(1)
         B, k, D = text_features.shape
@@ -408,7 +434,53 @@ def test_fff_soft_dup():
     print("FFF soft dup tests passed")
 
 
+def test_fff_max_logit_scale():
+    """The cap clamps the parameter, not the graph: the gradient stays live."""
+    torch.manual_seed(0)
+    B, k, D = 4, 2, 16
+    img = torch.randn(B, D)
+    txt = torch.randn(B, k, D)
+
+    # uncapped by default, and 0 means uncapped too
+    assert FFFLoss().max_logit_scale is None
+    assert FFFLoss(max_logit_scale=0).max_logit_scale is None
+
+    # a scale restored above the cap is pulled down on the next forward ...
+    fn = FFFLoss(max_logit_scale=15.0)
+    with torch.no_grad():
+        fn.log_logit_scale.fill_(math.log(24.7))
+    loss = fn(img, txt)
+    assert math.isclose(fn.logit_scale.item(), 15.0, rel_tol=1e-6), fn.logit_scale.item()
+
+    # ... the loss is the one a scale of exactly the cap gives ...
+    ref = FFFLoss(logit_scale=15.0)
+    ref.logit_bias.data.copy_(fn.logit_bias.data)
+    assert torch.allclose(loss, ref(img, txt))
+
+    # ... and at the cap the gradient still reaches the scale (a graph clamp
+    # would leave it at zero, pinning the scale there for good)
+    loss.backward()
+    assert fn.log_logit_scale.grad is not None and fn.log_logit_scale.grad.abs() > 0
+
+    # below the cap nothing changes
+    below = FFFLoss(max_logit_scale=15.0)
+    plain = FFFLoss()
+    assert torch.allclose(below(img, txt), plain(img, txt))
+    assert math.isclose(below.logit_scale.item(), 4.35, rel_tol=1e-6)
+
+    for bad in (dict(max_logit_scale=-1.0), dict(logit_scale=20.0, max_logit_scale=15.0)):
+        try:
+            FFFLoss(**bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'{bad} should be refused')
+
+    print("FFF max_logit_scale tests passed")
+
+
 if __name__ == "__main__":
     test_fff_loss()
     test_fff_soft_dup()
+    test_fff_max_logit_scale()
     print("FFFLoss test passed.")
