@@ -129,9 +129,14 @@ class FFFLoss(nn.Module):
 
     def forward(self, image_features, text_features, dup_mask=None,
                 ref_image_features=None, ref_text_features=None,
-                soft_dup_mask=None):
+                soft_dup_mask=None, soft_dup_neg_weight=None):
         """
         Args:
+            soft_dup_neg_weight: optional (B, B*k) float tensor of per-pair
+                negative weights in [0, 1] -- the graded form of soft_dup_mask
+                (it takes precedence, and soft_dup_weight is then unused). A
+                pair that is not already positive gets the target 1 - w; w = 1
+                leaves an ordinary negative, w = 0 a full positive.
             image_features: (B, D) image embeddings.
             text_features: (B, k, D) text embeddings, k captions per image
                 (all treated as positives of their image). (B, D) is accepted
@@ -224,7 +229,7 @@ class FFFLoss(nn.Module):
                 s_cc = torch.matmul(txt_flat, txt_flat.T)  # (B*k, B*k)
                 m |= (s_cc > self.p_dup).view(B, k, B * k).any(dim=1)
 
-            if soft_dup_mask is not None and self.soft_dup_weight <= 0.0:
+            if soft_dup_neg_weight is None and soft_dup_mask is not None and self.soft_dup_weight <= 0.0:
                 # w = 0 is exactly a hard duplicate; folding it in here keeps
                 # the fast +/-1 path below for the common case. Deliberately
                 # AFTER the dup_mask/p_dup chain above -- slotting it in as
@@ -233,7 +238,13 @@ class FFFLoss(nn.Module):
                 m |= soft_dup_mask.to(m.device)
                 soft_dup_mask = None
 
-            if soft_dup_mask is None or self.soft_dup_weight >= 1.0:
+            if soft_dup_neg_weight is not None:
+                # Graded: each pair its own partial label, 1 - w (see the BCE
+                # form below); positives stay 1.
+                target = m.float()
+                w = soft_dup_neg_weight.to(device=m.device, dtype=target.dtype)
+                target = torch.where(~m & (w < 1.0), 1.0 - w, target)
+            elif soft_dup_mask is None or self.soft_dup_weight >= 1.0:
                 m = m.float() * 2 - 1  # {-1, +1}
                 target = None
             else:

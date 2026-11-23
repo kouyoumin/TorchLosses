@@ -15,6 +15,7 @@ class ContrastiveLoss(nn.Module):
                 queue_size=4096,
                 dedup=False,
                 soft_dup_weight=0.0,
+                soft_weight_fn=None,
                 reduction='mean'):
         """
         Args:
@@ -44,6 +45,15 @@ class ContrastiveLoss(nn.Module):
                 that is how it is implemented. The shift applies to logits that
                 have ALREADY been divided by the temperature, which is why w
                 needs no retuning when the temperature moves (or is learned).
+            soft_weight_fn: optional callable (ids_a (B,), ids_b (N,)) -> (B, N)
+                float tensor of per-pair negative weights in [0, 1], replacing
+                the single soft_dup_weight for GRADED similarity: the soft ids
+                are then opaque keys the callable understands (train.py passes
+                study-structure rows), are queued like any soft id, and every
+                pair -- in the batch and against the queue -- gets its own w,
+                applied by the same -log(w) shift (w == 0 masks). The diagonal
+                (a sample's own positive) is never touched. soft_dup_weight is
+                ignored while this is set; the callable carries its own floor.
             reduction: 'mean' | 'sum' | 'none'.  Use 'none' to get per-sample
                 losses of shape (B,) for use with OHEM wrappers.
         """
@@ -56,6 +66,7 @@ class ContrastiveLoss(nn.Module):
         self.queue_size = queue_size
         self.dedup = dedup
         self.soft_dup_weight = float(soft_dup_weight)
+        self.soft_weight_fn = soft_weight_fn
         self.reduction = reduction
         # Registered as buffers so .to()/.cuda() move the queue with the module.
         # persistent=False: the queue holds embeddings produced by whatever the
@@ -149,7 +160,8 @@ class ContrastiveLoss(nn.Module):
         # leaves them as ordinary negatives, so only 0 < w < 1 needs the shift.
         soft_mask = None
         soft_penalty = 0.0
-        if soft_dup_ids is not None and self.soft_dup_weight < 1.0:
+        graded = self.soft_weight_fn is not None and soft_dup_ids is not None
+        if soft_dup_ids is not None and self.soft_dup_weight < 1.0 and not graded:
             soft_dup_ids = soft_dup_ids.to(f1.device)
             soft_mask = (soft_dup_ids.view(-1, 1) == soft_dup_ids.view(1, -1)) & ~eye
             if self.soft_dup_weight <= 0.0:
@@ -170,7 +182,8 @@ class ContrastiveLoss(nn.Module):
             if dup_ids is not None and self._queue_ids is not None:
                 queue_ids = self._queue_ids[:self._queue_filled].to(f1.device)
                 queue_mask = dup_ids.view(-1, 1) == queue_ids.view(1, -1)  # B x K
-            if soft_dup_ids is not None and self._queue_soft_ids is not None and self.soft_dup_weight < 1.0:
+            if (soft_dup_ids is not None and self._queue_soft_ids is not None and self.soft_dup_weight < 1.0
+                    and not graded):
                 q_soft_ids = self._queue_soft_ids[:self._queue_filled].to(f1.device)
                 q_soft = soft_dup_ids.view(-1, 1) == q_soft_ids.view(1, -1)  # B x K
                 if self.soft_dup_weight <= 0.0:
@@ -180,10 +193,30 @@ class ContrastiveLoss(nn.Module):
         else:
             all_f2 = f2
 
+        # Graded soft duplicates: one weight per pair from soft_weight_fn, over
+        # the batch and every queued row that remembers its soft id (a row
+        # queued without one is an ordinary negative).
+        graded_shift = graded_zero = None
+        if graded:
+            soft_dup_ids = soft_dup_ids.to(f1.device)
+            with torch.no_grad():
+                keys = soft_dup_ids
+                if all_f2.shape[0] > B and self._queue_soft_ids is not None:
+                    keys = torch.cat([soft_dup_ids, self._queue_soft_ids[:self._queue_filled].to(f1.device)])
+                w = self.soft_weight_fn(soft_dup_ids, keys).to(device=f1.device, dtype=torch.float32)
+                if w.shape[1] < all_f2.shape[0]:
+                    w = torch.cat([w, w.new_ones(B, all_f2.shape[0] - w.shape[1])], dim=1)
+                w[:, :B] = w[:, :B].masked_fill(eye, 1.0)
+                graded_zero = w <= 0
+                graded_shift = torch.where(graded_zero, torch.zeros_like(w), -torch.log(w.clamp_min(1e-30)))
+
         logits_a = torch.matmul(f1, all_f2.T) / temperature  # B x (B+K)
         # Soft first, hard second: a pair that is both stays fully masked.
         if soft_mask is not None:
             logits_a[:, :B] = logits_a[:, :B] - soft_penalty * soft_mask.to(logits_a.dtype)
+        if graded_shift is not None:
+            logits_a[:, :B] = (logits_a[:, :B] - graded_shift[:, :B].to(logits_a.dtype)
+                               ).masked_fill(graded_zero[:, :B], -1e4)
         if fn_mask is not None:
             logits_a[:, :B] = logits_a[:, :B].masked_fill(fn_mask, -1e4)
 
@@ -208,6 +241,10 @@ class ContrastiveLoss(nn.Module):
 
         if soft_queue_mask is not None:
             logits_a[:, B:] = logits_a[:, B:] - soft_penalty * soft_queue_mask.to(logits_a.dtype)
+        if graded_shift is not None and all_f2.shape[0] > B:
+            # After the threshold read above, which needs the unshifted logits.
+            logits_a[:, B:] = (logits_a[:, B:] - graded_shift[:, B:].to(logits_a.dtype)
+                               ).masked_fill(graded_zero[:, B:], -1e4)
         if queue_mask is not None:
             logits_a[:, B:] = logits_a[:, B:].masked_fill(queue_mask, -1e4)
         labels_a = torch.arange(B, device=f1.device)
@@ -217,6 +254,8 @@ class ContrastiveLoss(nn.Module):
         logits_b = torch.matmul(f2, f1.T) / temperature      # B x B
         if soft_mask is not None:
             logits_b = logits_b - soft_penalty * soft_mask.T.to(logits_b.dtype)
+        if graded_shift is not None:
+            logits_b = (logits_b - graded_shift[:, :B].T.to(logits_b.dtype)).masked_fill(graded_zero[:, :B].T, -1e4)
         if fn_mask is not None:
             logits_b = logits_b.masked_fill(fn_mask.T, -1e4)
         labels_b = torch.arange(B, device=f2.device)
